@@ -49,6 +49,16 @@ def wr(msg=''):
   sys.stdout.write('\n')
   #map(lambda x: sys.stderr.write('\t[%s]\n' % x),msg.split('\n'))
 
+# Helper to allow writing to a buffer so a block of output can be written all
+# at once if needed.
+def bwr(buffer=[], msg='', done=False):
+  if msg!=None:
+    buffer.append(msg)
+  if done:
+    for m in buffer:
+      wr(m)
+  return buffer
+
 def checkpoint(count):
   count=count+1
   if cfg_checkpoint_count>0 and count%cfg_checkpoint_count==0:
@@ -60,7 +70,12 @@ def checkpoint(count):
 def revnum_to_revref(rev, old_marks):
   """Convert an hg revnum to a git-fast-import rev reference (an SHA1
   or a mark)"""
-  return old_marks.get(rev) or ':%d' % (rev+1)
+  if not rev in old_marks:
+    # sys.stderr.write('revnum_to_revref: Could not find mark for rev: %d: %s\n' % (rev, (':%d' % (rev+1))))
+    return ':%d' % (rev+1)
+  else:
+    # sys.stderr.write('revnum_to_revref: Found mark for rev: %d: %s\n' % (rev, old_marks.get(rev)))
+    return old_marks.get(rev)
 
 def file_mismatch(f1,f2):
   """See if two revisions of a file are not equal."""
@@ -248,7 +263,7 @@ def strip_leading_slash(filename):
 
 def export_commit(ui,repo,revision,old_marks,max,count,authors,
                   branchesmap,sob,brmap,hgtags,encoding='',fn_encoding='',
-                  plugins={}):
+                  skipempty=False,plugins={}):
   def get_branchname(name):
     if brmap.has_key(name):
       return brmap[name]
@@ -272,17 +287,20 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
     author = commit_data['author']
     desc = commit_data['desc']
 
+  # Write the output for this commit to a list for now in case we want to cancel
+  # this because it contains no actual changes.
+  b=[]
   if len(parents)==0 and revision != 0:
-    wr('reset refs/heads/%s' % branch)
+    bwr(b, 'reset refs/heads/%s' % branch)
 
-  wr('commit refs/heads/%s' % branch)
-  wr('mark :%d' % (revision+1))
+  bwr(b, 'commit refs/heads/%s' % branch)
+  bwr(b, 'mark :%d' % (revision+1))
   if sob:
-    wr('author %s %d %s' % (author,time,timezone))
-  wr('committer %s %d %s' % (user,time,timezone))
-  wr('data %d' % (len(desc)+1)) # wtf?
-  wr(desc)
-  wr()
+    bwr(b, 'author %s %d %s' % (author,time,timezone))
+  bwr(b, 'committer %s %d %s' % (user,time,timezone))
+  bwr(b, 'data %d' % (len(desc)+1)) # wtf?
+  bwr(b, desc)
+  bwr(b, )
 
   ctx=revsymbol(repo,str(revision))
   man=ctx.manifest()
@@ -294,7 +312,7 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
     added.sort()
     type='full'
   else:
-    wr('from %s' % revnum_to_revref(parents[0], old_marks))
+    bwr(b, 'from %s' % revnum_to_revref(parents[0], old_marks))
     if len(parents) == 1:
       # later non-merge revision: feed in changed manifest
       # if we have exactly one parent, just take the changes from the
@@ -303,12 +321,42 @@ def export_commit(ui,repo,revision,old_marks,max,count,authors,
       added,changed,removed=f[1],f[0],f[2]
       type='simple delta'
     else: # a merge with two parents
-      wr('merge %s' % revnum_to_revref(parents[1], old_marks))
+      bwr(b, 'merge %s' % revnum_to_revref(parents[1], old_marks))
       # later merge revision: feed in changed manifest
       # for many files comparing checksums is expensive so only do it for
       # merges where we really need it due to hg's revlog logic
       added,changed,removed=get_filechanges(repo,revision,parents,man)
       type='thorough delta'
+
+  if skipempty:
+    a = len(added)
+    c = len(changed)
+    r = len(removed)
+
+    if not hgtags:
+      if 1 == a and '.hgtags' in added:
+        a = 0
+
+      if 1 == c and '.hgtags' in changed:
+        c = 0
+
+    if 0 == a and 0 == c and 0 == r:
+      # This commit is empty. This likely means it was for adding a tag in hg
+      # which does not require a commit in git.
+
+      sys.stderr.write('%s: NOT Exporting empty %s revision %d/%d with %d/%d/%d added/changed/removed files\n' %
+        (branch,type,revision+1,max,len(added),len(changed),len(removed)))
+
+      # If another revision references this as a parent it will fail, so point
+      # that at this revision's parent instead.
+      old_marks[revision] = revnum_to_revref(parents[0], old_marks)
+
+      # Return without writing the actual revision since we have decided that
+      # it isn't needed since it is empty.
+      return 0
+
+  # Actually write the commit
+  bwr(b, msg=None, done=True)
 
   sys.stderr.write('%s: Exporting %s revision %d/%d with %d/%d/%d added/changed/removed files\n' %
       (branch,type,revision+1,max,len(added),len(changed),len(removed)))
@@ -457,7 +505,7 @@ def verify_heads(ui,repo,cache,force,branchesmap):
 def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
            authors={},branchesmap={},tagsmap={},
            sob=False,force=False,hgtags=False,notes=False,encoding='',fn_encoding='',
-           plugins={}):
+           skipempty=False, plugins={}):
   def check_cache(filename, contents):
     if len(contents) == 0:
       sys.stderr.write('Warning: %s does not contain any data, this will probably make an incremental import fail\n' % filename)
@@ -508,7 +556,7 @@ def hg2git(repourl,m,marksfile,mappingfile,headsfile,tipfile,
   brmap={}
   for rev in range(min,max):
     c=export_commit(ui,repo,rev,old_marks,max,c,authors,branchesmap,
-                    sob,brmap,hgtags,encoding,fn_encoding,
+                    sob,brmap,hgtags,encoding,fn_encoding,skipempty,
                     plugins)
   if notes:
     for rev in range(min,max):
@@ -549,6 +597,8 @@ if __name__=='__main__':
       default=False,help="Enable parsing Signed-off-by lines")
   parser.add_option("--hgtags",action="store_true",dest="hgtags",
       default=False,help="Enable exporting .hgtags files")
+  parser.add_option("--skip-empty",action="store_true",dest="skipempty",
+      default=False,help="Enable skipping of empty commits")
   parser.add_option("-A","--authors",dest="authorfile",
       help="Read authormap from AUTHORFILE")
   parser.add_option("-B","--branches",dest="branchesfile",
@@ -653,4 +703,4 @@ if __name__=='__main__':
                   authors=a,branchesmap=b,tagsmap=t,
                   sob=options.sob,force=options.force,hgtags=options.hgtags,
                   notes=options.notes,encoding=encoding,fn_encoding=fn_encoding,
-                  plugins=plugins_dict))
+                  skipempty=options.skipempty, plugins=plugins_dict))
